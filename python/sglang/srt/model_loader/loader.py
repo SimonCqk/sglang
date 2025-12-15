@@ -1978,7 +1978,12 @@ class GGUFModelLoader(BaseModelLoader):
 
 
 class RemoteInstanceModelLoader(BaseModelLoader):
-    """Model loader that can load Tensors from remote sglang instance."""
+    """Model loader that can load Tensors from remote sglang instance.
+
+    Supports two modes of seed instance discovery:
+    1. Explicit configuration: Specify seed_instance_ip, service_port, and group_ports
+    2. Gateway auto-discovery: Specify gateway_url to automatically discover seed instance
+    """
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -1990,6 +1995,66 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         raise NotImplementedError
+
+    def _discover_seed_instance_via_gateway(
+        self, model_config: ModelConfig
+    ) -> None:
+        """
+        Discover seed instance through Gateway and update load_config.
+
+        This method queries the Gateway to find available seed instances
+        and updates the load_config with the discovered seed instance info.
+        """
+        from sglang.srt.model_loader.gateway_discovery import (
+            select_best_seed_instance,
+            wait_for_seed_instance,
+        )
+
+        load_config = self.load_config
+
+        logger.info(
+            f"Discovering seed instance via Gateway at {load_config.gateway_url}..."
+        )
+
+        # Wait for a seed instance to become available
+        seed_info = wait_for_seed_instance(
+            gateway_url=load_config.gateway_url,
+            model_path=model_config.model_path,
+            tp_size=load_config.tp_size,
+            timeout=load_config.gateway_discovery_timeout,
+            poll_interval=load_config.gateway_discovery_poll_interval,
+        )
+
+        if seed_info is None:
+            raise RuntimeError(
+                f"Failed to discover seed instance via Gateway at {load_config.gateway_url}. "
+                f"No seed instance found for model={model_config.model_path}, "
+                f"tp_size={load_config.tp_size}. "
+                "Please ensure a seed instance is registered with the Gateway."
+            )
+
+        # Validate that the seed instance has enough group ports
+        if len(seed_info.group_ports) <= load_config.tp_rank:
+            raise RuntimeError(
+                f"Seed instance at {seed_info.ip} has {len(seed_info.group_ports)} "
+                f"group ports, but tp_rank={load_config.tp_rank} requires at least "
+                f"{load_config.tp_rank + 1} ports."
+            )
+
+        # Update load_config with discovered seed instance info
+        load_config.remote_instance_weight_loader_seed_instance_ip = seed_info.ip
+        load_config.remote_instance_weight_loader_seed_instance_service_port = (
+            seed_info.service_port
+        )
+        load_config.remote_instance_weight_loader_send_weights_group_ports = (
+            seed_info.group_ports
+        )
+
+        logger.info(
+            f"Discovered seed instance: ip={seed_info.ip}, "
+            f"service_port={seed_info.service_port}, "
+            f"group_ports={seed_info.group_ports}"
+        )
 
     def load_model(
         self,
@@ -2004,6 +2069,25 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"Model loader {self.load_config.load_format} is not supported for "
             f"load format {load_config.load_format}"
         )
+
+        # Check if we need to discover seed instance via Gateway
+        if (
+            load_config.gateway_url
+            and not load_config.remote_instance_weight_loader_seed_instance_ip
+        ):
+            self._discover_seed_instance_via_gateway(model_config)
+
+        # Validate that we have the required seed instance configuration
+        if not load_config.remote_instance_weight_loader_seed_instance_ip:
+            raise ValueError(
+                "remote_instance_weight_loader_seed_instance_ip is required. "
+                "Either specify it explicitly or use --gateway-url for auto-discovery."
+            )
+        if not load_config.remote_instance_weight_loader_send_weights_group_ports:
+            raise ValueError(
+                "remote_instance_weight_loader_send_weights_group_ports is required. "
+                "Either specify it explicitly or use --gateway-url for auto-discovery."
+            )
 
         model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
 

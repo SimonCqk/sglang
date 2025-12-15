@@ -611,6 +611,12 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
 
+    # Gateway-based service discovery for seed instance
+    gateway_url: Optional[str] = None  # Gateway URL for auto-discovery of seed instance
+    enable_seed_instance: bool = False  # Register this instance as a seed instance
+    gateway_discovery_timeout: float = 300.0  # Timeout for waiting for seed instance
+    gateway_discovery_poll_interval: float = 5.0  # Poll interval for discovery
+
     # For PD-Multiplexing
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
@@ -4236,6 +4242,34 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.remote_instance_weight_loader_send_weights_group_ports,
             help="The communication group ports for loading weights from remote instance.",
+        )
+
+        # Gateway-based service discovery for seed instance
+        parser.add_argument(
+            "--gateway-url",
+            type=str,
+            default=ServerArgs.gateway_url,
+            help="Gateway URL for auto-discovery of seed instance (e.g., http://gateway:30000). "
+            "When specified with --load-format=remote_instance, the seed instance will be "
+            "automatically discovered instead of requiring explicit IP configuration.",
+        )
+        parser.add_argument(
+            "--enable-seed-instance",
+            action="store_true",
+            help="Register this instance as a seed instance with the Gateway. "
+            "Other instances can then discover and load weights from this instance.",
+        )
+        parser.add_argument(
+            "--gateway-discovery-timeout",
+            type=float,
+            default=ServerArgs.gateway_discovery_timeout,
+            help="Timeout in seconds for waiting for a seed instance to become available.",
+        )
+        parser.add_argument(
+            "--gateway-discovery-poll-interval",
+            type=float,
+            default=ServerArgs.gateway_discovery_poll_interval,
+            help="Poll interval in seconds when waiting for seed instance discovery.",
         )
 
         # For PD-Multiplexing

@@ -761,9 +761,14 @@ class ModelRunner:
             download_dir=self.server_args.download_dir,
             model_loader_extra_config=self.server_args.model_loader_extra_config,
             tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
             remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+            # Gateway-based service discovery
+            gateway_url=self.server_args.gateway_url,
+            gateway_discovery_timeout=self.server_args.gateway_discovery_timeout,
+            gateway_discovery_poll_interval=self.server_args.gateway_discovery_poll_interval,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
         )
@@ -773,7 +778,13 @@ class ModelRunner:
             )
 
         if self.server_args.load_format == LoadFormat.REMOTE_INSTANCE:
-            if self.tp_rank == 0:
+            # Only trigger init request if seed instance is explicitly configured
+            # (not when using gateway auto-discovery)
+            if (
+                self.tp_rank == 0
+                and self.server_args.remote_instance_weight_loader_seed_instance_ip
+                and not self.server_args.gateway_url
+            ):
                 instance_ip = socket.gethostbyname(socket.gethostname())
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,
@@ -855,6 +866,10 @@ class ModelRunner:
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
+
+        # Register as seed instance with Gateway if enabled
+        if self.server_args.enable_seed_instance and self.server_args.gateway_url:
+            self._register_as_seed_instance()
         if self.server_args.debug_tensor_dump_output_folder is not None:
             register_forward_hook_for_model(
                 self.model,
@@ -984,6 +999,49 @@ class ModelRunner:
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
+
+    def _register_as_seed_instance(self) -> None:
+        """Register this instance as a seed instance with the Gateway."""
+        from sglang.srt.model_loader.gateway_discovery import (
+            get_local_ip,
+            register_as_seed_instance,
+        )
+
+        # Only rank 0 registers with the Gateway
+        if self.tp_rank != 0:
+            return
+
+        instance_ip = get_local_ip()
+        group_ports = self.server_args.remote_instance_weight_loader_send_weights_group_ports
+
+        if not group_ports:
+            logger.warning(
+                "Cannot register as seed instance: "
+                "remote_instance_weight_loader_send_weights_group_ports not configured. "
+                "Please specify --remote-instance-weight-loader-send-weights-group-ports."
+            )
+            return
+
+        success = register_as_seed_instance(
+            gateway_url=self.server_args.gateway_url,
+            instance_ip=instance_ip,
+            service_port=self.server_args.port,
+            group_ports=group_ports,
+            model_path=self.server_args.model_path,
+            tp_size=self.tp_size,
+        )
+
+        if success:
+            logger.info(
+                f"Successfully registered as seed instance with Gateway at "
+                f"{self.server_args.gateway_url}"
+            )
+        else:
+            logger.warning(
+                f"Failed to register as seed instance with Gateway at "
+                f"{self.server_args.gateway_url}. "
+                "Other instances may not be able to discover this instance."
+            )
 
     def init_weights_send_group_for_remote_instance(
         self,

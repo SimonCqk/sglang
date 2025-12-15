@@ -70,9 +70,15 @@ class LoadConfig:
     decryption_key_file: Optional[str] = None
     decrypt_max_concurrency: int = -1
     tp_rank: Optional[int] = None
+    tp_size: Optional[int] = None
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
+
+    # Gateway-based service discovery for seed instance
+    gateway_url: Optional[str] = None  # Gateway URL for auto-discovery
+    gateway_discovery_timeout: float = 300.0  # Timeout for waiting for seed instance
+    gateway_discovery_poll_interval: float = 5.0  # Poll interval for discovery
 
     # ModelOpt-specific loading options
     modelopt_checkpoint_restore_path: Optional[str] = None

@@ -513,6 +513,131 @@ async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
     Json(response).into_response()
 }
 
+/// Query parameters for seed instance discovery
+#[derive(Debug, Deserialize)]
+struct SeedInstanceQuery {
+    /// Filter by model path
+    model_path: Option<String>,
+    /// Filter by tensor parallelism size
+    tp_size: Option<usize>,
+}
+
+/// Seed instance information for weight loading
+#[derive(Debug, serde::Serialize)]
+struct SeedInstanceInfo {
+    /// IP address of the seed instance
+    ip: String,
+    /// HTTP service port
+    service_port: u16,
+    /// NCCL communication group ports for weight transfer
+    group_ports: Vec<u16>,
+    /// Model path being served
+    model_path: Option<String>,
+    /// Tensor parallelism size
+    tp_size: Option<usize>,
+    /// Full worker URL
+    url: String,
+    /// Whether the instance is healthy
+    is_healthy: bool,
+}
+
+/// Constants for seed instance labels
+const SEED_INSTANCE_LABEL: &str = "sglang.ai/seed-instance";
+const SEED_SERVICE_PORT_LABEL: &str = "sglang.ai/seed-service-port";
+const SEED_GROUP_PORTS_LABEL: &str = "sglang.ai/seed-group-ports";
+const SEED_MODEL_PATH_LABEL: &str = "sglang.ai/model-path";
+const SEED_TP_SIZE_LABEL: &str = "sglang.ai/tp-size";
+
+/// Get available seed instances for weight loading
+///
+/// This endpoint allows new SGLang instances to discover existing instances
+/// that can provide model weights for fast startup.
+async fn get_seed_instances(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SeedInstanceQuery>,
+) -> Response {
+    let workers = state.context.worker_registry.get_all();
+
+    let seed_instances: Vec<SeedInstanceInfo> = workers
+        .iter()
+        .filter_map(|worker| {
+            let metadata = worker.metadata();
+
+            // Check if this is a seed instance
+            if metadata.labels.get(SEED_INSTANCE_LABEL) != Some(&"true".to_string()) {
+                return None;
+            }
+
+            // Check health
+            if !worker.is_healthy() {
+                return None;
+            }
+
+            // Filter by model_path if specified
+            let worker_model_path = metadata.labels.get(SEED_MODEL_PATH_LABEL).cloned();
+            if let Some(ref filter_model_path) = query.model_path {
+                if worker_model_path.as_ref() != Some(filter_model_path) {
+                    return None;
+                }
+            }
+
+            // Filter by tp_size if specified
+            let worker_tp_size: Option<usize> = metadata
+                .labels
+                .get(SEED_TP_SIZE_LABEL)
+                .and_then(|s| s.parse().ok());
+            if let Some(filter_tp_size) = query.tp_size {
+                if let Some(wts) = worker_tp_size {
+                    if wts != filter_tp_size {
+                        return None;
+                    }
+                }
+            }
+
+            // Parse group ports
+            let group_ports: Vec<u16> = metadata
+                .labels
+                .get(SEED_GROUP_PORTS_LABEL)
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            if group_ports.is_empty() {
+                return None;
+            }
+
+            // Extract IP from worker URL
+            let url = worker.url().to_string();
+            let ip = url::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from))?;
+
+            // Get service port
+            let service_port: u16 = metadata
+                .labels
+                .get(SEED_SERVICE_PORT_LABEL)
+                .and_then(|s| s.parse().ok())
+                .or_else(|| url::Url::parse(&url).ok().and_then(|u| u.port()))
+                .unwrap_or(8000);
+
+            Some(SeedInstanceInfo {
+                ip,
+                service_port,
+                group_ports,
+                model_path: worker_model_path,
+                tp_size: worker_tp_size,
+                url,
+                is_healthy: worker.is_healthy(),
+            })
+        })
+        .collect();
+
+    let response = json!({
+        "seed_instances": seed_instances,
+        "total": seed_instances.len(),
+    });
+    Json(response).into_response()
+}
+
 async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
     let job_queue = state
         .context
@@ -720,6 +845,8 @@ pub fn build_app(
             "/workers/{url}",
             get(get_worker).put(update_worker).delete(delete_worker),
         )
+        // Seed instance discovery for weight loading
+        .route("/seed-instances", get(get_seed_instances))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
