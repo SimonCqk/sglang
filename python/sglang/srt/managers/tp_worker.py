@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    SendWeightsToRemoteInstanceLayerwiseReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -133,6 +134,17 @@ class BaseTpWorker(ABC):
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
         success, message = self.model_runner.send_weights_to_remote_instance(
+            recv_req.master_address,
+            recv_req.ports,
+            recv_req.group_name,
+        )
+        return success, message
+
+    def send_weights_to_remote_instance_layerwise(
+        self, recv_req: SendWeightsToRemoteInstanceLayerwiseReqInput
+    ):
+        """Send weights layer-by-layer to enable computation overlap."""
+        success, message = self.model_runner.send_weights_to_remote_instance_layerwise(
             recv_req.master_address,
             recv_req.ports,
             recv_req.group_name,

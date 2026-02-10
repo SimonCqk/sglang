@@ -57,11 +57,18 @@ def trigger_transferring_weights_request(
     remote_instance_weight_loader_seed_instance_service_port: int,
     remote_instance_weight_loader_send_weights_group_ports: List[int],
     remote_instance_weight_loader_client_id: str,
+    layerwise: bool = False,
 ):
     seed_instance_service_url = f"http://{remote_instance_weight_loader_seed_instance_ip}:{remote_instance_weight_loader_seed_instance_service_port}"
     try:
+        # Choose endpoint based on layerwise mode
+        endpoint = (
+            "send_weights_to_remote_instance_layerwise"
+            if layerwise
+            else "send_weights_to_remote_instance"
+        )
         requests.post(
-            f"{seed_instance_service_url}/send_weights_to_remote_instance",
+            f"{seed_instance_service_url}/{endpoint}",
             json={
                 "master_address": remote_instance_weight_loader_seed_instance_ip,
                 "ports": (

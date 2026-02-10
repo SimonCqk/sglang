@@ -27,6 +27,7 @@ class LoadFormat(str, enum.Enum):
     JAX = "jax"
     REMOTE = "remote"
     REMOTE_INSTANCE = "remote_instance"
+    LAYERWISE_REMOTE_INSTANCE = "layerwise_remote_instance"
     RDMA = "rdma"
     LOCAL_CACHED = "local_cached"
     FASTSAFETENSORS = "fastsafetensors"
@@ -76,6 +77,9 @@ class LoadConfig:
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
     remote_instance_weight_loader_backend: Optional[str] = None
     remote_instance_weight_loader_transfer_engine: Optional[Any] = None
+
+    # Layerwise broadcast options
+    layerwise_broadcast_timeout: float = 60.0  # Per-layer timeout in seconds
 
     # ModelOpt-specific loading options
     modelopt_checkpoint_restore_path: Optional[str] = None

@@ -538,7 +538,6 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
         yield from self._get_weights_iterator(primary_weights)
 
@@ -629,7 +628,6 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Load base model using shared method
             model = self._load_modelopt_base_model(model_config)
@@ -1234,7 +1232,6 @@ class DummyModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         if get_bool_env_var("SGL_CPU_QUANTIZATION"):
             return load_model_with_cpu_quantization(
                 self, model_config=model_config, device_config=device_config
@@ -1701,7 +1698,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if self._is_4bit_weight_name(weight_name):
                 continue
 
@@ -1725,7 +1721,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if any(
                 target_module in weight_name for target_module in self.target_modules
             ) and weight_name.endswith(".weight"):
@@ -1735,7 +1730,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     module in weight_name
                     for module in self.column_parallel_weights_modules
                 ):
-
                     total_size = weight_tensor.size(-1)
                     start_index = total_size // tp_size * tp_rank
                     end_index = total_size // tp_size * (tp_rank + 1)
@@ -1796,7 +1790,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         self.model_type = type(model).__name__
 
         logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -1808,8 +1802,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 pre_quant = True
             else:
                 raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
                 )
 
         # The quant_states in pre_quantized models cannot work with a split
@@ -2002,7 +1995,6 @@ class GGUFModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         local_model_path = self._prepare_weights(model_config.model_path)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know if tie word embeddings after mapping weights
@@ -2064,7 +2056,17 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             load_config.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
-            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
+            port_for_rank = (
+                load_config.remote_instance_weight_loader_send_weights_group_ports[
+                    load_config.tp_rank
+                ]
+            )
+            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{port_for_rank}"
+            logger.info(
+                f"[RemoteInstanceModelLoader][TP rank {load_config.tp_rank}] "
+                f"Connecting to seed instance via NCCL at {model_weights}, "
+                f"all_ports={load_config.remote_instance_weight_loader_send_weights_group_ports}"
+            )
             with create_remote_connector(model_weights, device_config.device) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.INSTANCE:
@@ -2221,6 +2223,540 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         return True
 
 
+class LayerwiseBroadcastModelLoader(RemoteInstanceModelLoader):
+    """Model loader that streams weights layer-by-layer, enabling computation overlap.
+
+    This loader extends RemoteInstanceModelLoader to support layer-wise weight transfer,
+    allowing inference to start on early layers while later layers are still being
+    transferred.
+
+    The key difference from RemoteInstanceModelLoader is:
+    - Weights are transferred in order: embed_tokens -> layers[0..N] -> norm -> lm_head
+    - A LayerReadinessTracker is attached to the model to track loading progress
+    - The model's forward() method can block on layer readiness for overlapped execution
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        self.layer_tracker = None
+        self._layer_tracker_hooks = []
+        self.transfer_thread = None
+        self._transfer_error = None
+        self._transfer_complete = threading.Event()
+
+    def download_model(self, model_config) -> None:
+        raise NotImplementedError
+
+    def _init_model_and_tracker(self, model_config, device_config):
+        """Allocate model on GPU and create the layer readiness tracker."""
+        from sglang.srt.model_loader.layer_readiness_tracker import (
+            LayerReadinessTracker,
+        )
+
+        load_config = self.load_config
+        assert load_config.load_format == LoadFormat.LAYERWISE_REMOTE_INSTANCE, (
+            f"Model loader {self.load_config.load_format} is not supported for "
+            f"load format {load_config.load_format}"
+        )
+
+        with set_default_torch_dtype(model_config.dtype):
+            with torch.device(device_config.device):
+                model = _initialize_model(model_config, self.load_config)
+
+        num_layers = model_config.hf_config.num_hidden_layers
+        self.layer_tracker = LayerReadinessTracker(num_layers)
+
+        return model
+
+    def _do_layerwise_transfer(self, model, model_config, device_config):
+        """Dispatch weight transfer to the configured backend (NCCL or TE).
+
+        This method performs the actual layer-by-layer weight transfer,
+        marking layers ready in self.layer_tracker as they complete.
+        """
+        load_config = self.load_config
+
+        if (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.NCCL
+        ):
+            port_for_rank = (
+                load_config.remote_instance_weight_loader_send_weights_group_ports[
+                    load_config.tp_rank
+                ]
+            )
+            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{port_for_rank}"
+            logger.info(
+                f"[LayerwiseBroadcastModelLoader][TP rank {load_config.tp_rank}] "
+                f"Connecting to seed instance via NCCL at {model_weights}, "
+                f"all_ports={load_config.remote_instance_weight_loader_send_weights_group_ports}"
+            )
+            with create_remote_connector(model_weights, device_config.device) as client:
+                connector_type = get_connector_type(client)
+                if connector_type == ConnectorType.INSTANCE:
+                    self._load_model_layerwise_by_nccl(
+                        model, client, model_config, device_config
+                    )
+                else:
+                    raise ValueError(
+                        f"Unsupported connector type {connector_type} for "
+                        f"layerwise remote tensor model loading."
+                    )
+        elif (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+        ):
+            transfer_engine = load_config.remote_instance_weight_loader_transfer_engine
+            if transfer_engine is None:
+                raise RuntimeError(
+                    "Transfer engine is not initialized for layerwise remote "
+                    "instance model loader with `transfer_engine` backend."
+                )
+            logger.info(
+                "TransferEngine registering memory regions for layerwise "
+                "loading (this may take a few seconds)..."
+            )
+            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                model, transfer_engine
+            )
+            logger.info(
+                "TransferEngine memory regions have been successfully registered."
+            )
+            seed_url = (
+                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}"
+                f":{load_config.remote_instance_weight_loader_seed_instance_service_port}"
+            )
+            self._load_model_layerwise_by_transfer_engine(
+                model, transfer_engine, seed_url, load_config.tp_rank
+            )
+        else:
+            raise ValueError(
+                f"Unsupported backend for layerwise broadcast: "
+                f"{load_config.remote_instance_weight_loader_backend}"
+            )
+
+    def start_async_transfer(self, *, model_config, device_config) -> nn.Module:
+        """Start layerwise weight transfer in a background thread.
+
+        Allocates the model (all tensors on GPU, uninitialized) and starts
+        the weight transfer in a daemon thread. The tracker is NOT attached
+        to the model so that warmup forward passes run without blocking.
+
+        Returns the model immediately.
+        """
+        logger.info(
+            "Starting async layerwise weight transfer in background thread ..."
+        )
+
+        model = self._init_model_and_tracker(model_config, device_config)
+        self._transfer_complete.clear()
+        self._transfer_error = None
+
+        def _transfer_worker():
+            try:
+                self._do_layerwise_transfer(model, model_config, device_config)
+            except Exception as e:
+                logger.error(f"Layerwise transfer failed: {e}")
+                self._transfer_error = e
+            finally:
+                self._transfer_complete.set()
+
+        self.transfer_thread = threading.Thread(
+            target=_transfer_worker, daemon=True, name="layerwise-transfer"
+        )
+        self.transfer_thread.start()
+
+        return model.eval()
+
+    def wait_for_transfer_complete(self, timeout=None):
+        """Block until the background transfer finishes.
+
+        Raises any error that occurred during transfer.
+        """
+        if not self._transfer_complete.wait(timeout=timeout):
+            raise TimeoutError(
+                f"Layerwise weight transfer did not complete within {timeout}s"
+            )
+        if self._transfer_error is not None:
+            raise self._transfer_error
+
+    def attach_layer_tracker(self, model):
+        """Attach forward hooks that block until each layer's weights are ready."""
+        inner_model = getattr(model, "model", model)
+        tracker = self.layer_tracker
+        self._layer_tracker_hooks = []
+
+        def _make_wait_hook(wait_fn):
+            def hook(module, args):
+                wait_fn()
+
+            return hook
+
+        # Hook on embed_tokens
+        if hasattr(inner_model, "embed_tokens"):
+            h = inner_model.embed_tokens.register_forward_pre_hook(
+                _make_wait_hook(tracker.wait_for_embed)
+            )
+            self._layer_tracker_hooks.append(h)
+
+        # Hook on each decoder layer
+        if hasattr(inner_model, "layers"):
+            for i, layer in enumerate(inner_model.layers):
+                if layer is not None:
+                    h = layer.register_forward_pre_hook(
+                        _make_wait_hook(lambda idx=i: tracker.wait_for_layer(idx))
+                    )
+                    self._layer_tracker_hooks.append(h)
+
+        # Hook on norm (guards both norm and lm_head weights)
+        if hasattr(inner_model, "norm"):
+            h = inner_model.norm.register_forward_pre_hook(
+                _make_wait_hook(tracker.wait_for_lm_head)
+            )
+            self._layer_tracker_hooks.append(h)
+
+    def detach_layer_tracker(self, model):
+        """Remove forward hooks and mark model as fully loaded."""
+        for h in getattr(self, "_layer_tracker_hooks", []):
+            h.remove()
+        self._layer_tracker_hooks = []
+        model._fully_loaded = True
+
+    def load_model(
+        self,
+        *,
+        model_config,
+        device_config,
+    ) -> nn.Module:
+        """Synchronous load: allocates model, transfers all weights, returns when done."""
+        logger.info(
+            "Loading weights from remote instance using layerwise broadcast ..."
+        )
+
+        model = self._init_model_and_tracker(model_config, device_config)
+
+        # Attach forward hooks for forward() blocking during transfer
+        self.attach_layer_tracker(model)
+
+        self._do_layerwise_transfer(model, model_config, device_config)
+
+        return model.eval()
+
+    def _load_model_layerwise_by_nccl(
+        self, model, client, model_config, device_config
+    ) -> None:
+        """Load model weights layer-by-layer via NCCL broadcast."""
+        import re
+
+        load_config = self.load_config
+        instance_ip = socket.gethostbyname(socket.gethostname())
+        timeout = load_config.layerwise_broadcast_timeout
+
+        start_build_group_tic = time.time()
+        client.build_group(
+            gpu_id=device_config.gpu_id,
+            tp_rank=load_config.tp_rank,
+            instance_ip=instance_ip,
+        )
+        torch.cuda.synchronize()
+        end_build_group_tic = time.time()
+        logger.debug(
+            f"finish building group for layerwise remote instance, time used: "
+            f"{(end_build_group_tic - start_build_group_tic):.4f}s"
+        )
+
+        if load_config.tp_rank == 0:
+            t = threading.Thread(
+                target=trigger_transferring_weights_request,
+                args=(
+                    load_config.remote_instance_weight_loader_seed_instance_ip,
+                    load_config.remote_instance_weight_loader_seed_instance_service_port,
+                    load_config.remote_instance_weight_loader_send_weights_group_ports,
+                    instance_ip,
+                    True,  # layerwise flag
+                ),
+            )
+            t.start()
+
+        start_get_weights_tic = time.time()
+
+        # Group parameters by layer prefix
+        param_groups = self._group_params_by_layer(model)
+
+        def _sync_layer_group(work_handles: list):
+            """Synchronize a group of broadcast operations using CUDA events.
+
+            This is safer than torch.cuda.synchronize() which acquires the global
+            CUDA context lock and can interfere with NCCL's internal operations.
+
+            Pattern:
+            1. work.wait() establishes stream dependency (current stream waits for NCCL)
+            2. event.record() records a point on current stream after NCCL completes
+            3. event.synchronize() CPU-blocks until that point is reached
+            """
+            for work in work_handles:
+                work.wait()
+            if work_handles:
+                event = torch.cuda.Event()
+                event.record()
+                event.synchronize()
+
+        with set_default_torch_dtype(model_config.dtype):
+            # 1. Receive embed_tokens first
+            logger.debug("Receiving embed_tokens weights...")
+            work_handles = []
+            for name, tensor in param_groups.get("embed_tokens", []):
+                work = torch.distributed.broadcast(
+                    tensor.data,
+                    src=0,
+                    group=client._model_update_group,
+                    async_op=True,
+                )
+                work_handles.append(work)
+            _sync_layer_group(work_handles)
+            self.layer_tracker.mark_embed_ready()
+            logger.debug("Embed tokens loaded and ready")
+
+            # 2. Receive layers sequentially
+            num_layers = model_config.hf_config.num_hidden_layers
+            logger.info(f"Receiving {num_layers} layers via NCCL broadcast...")
+            for layer_idx in range(num_layers):
+                layer_key = f"layer_{layer_idx}"
+                logger.debug(f"Receiving layer {layer_idx} weights...")
+                work_handles = []
+                for name, tensor in param_groups.get(layer_key, []):
+                    work = torch.distributed.broadcast(
+                        tensor.data,
+                        src=0,
+                        group=client._model_update_group,
+                        async_op=True,
+                    )
+                    work_handles.append(work)
+                _sync_layer_group(work_handles)
+                self.layer_tracker.mark_layer_ready(layer_idx)
+                logger.debug(f"Layer {layer_idx} loaded and ready")
+            logger.info(f"All {num_layers} layers received via NCCL broadcast.")
+
+            # 3. Receive norm
+            logger.debug("Receiving norm weights...")
+            work_handles = []
+            for name, tensor in param_groups.get("norm", []):
+                work = torch.distributed.broadcast(
+                    tensor.data,
+                    src=0,
+                    group=client._model_update_group,
+                    async_op=True,
+                )
+                work_handles.append(work)
+
+            # 4. Receive lm_head
+            logger.debug("Receiving lm_head weights...")
+            for name, tensor in param_groups.get("lm_head", []):
+                work = torch.distributed.broadcast(
+                    tensor.data,
+                    src=0,
+                    group=client._model_update_group,
+                    async_op=True,
+                )
+                work_handles.append(work)
+            _sync_layer_group(work_handles)
+            self.layer_tracker.mark_lm_head_ready()
+            logger.debug("LM head and norm loaded and ready")
+
+            if hasattr(model, "post_load_weights"):
+                model.post_load_weights()
+
+        end_get_weights_tic = time.time()
+        logger.info(
+            f"Finished layerwise weight loading from remote instance, "
+            f"time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
+        )
+
+        # destroy the process group after loading weights
+        torch.distributed.distributed_c10d.destroy_process_group(
+            client._model_update_group
+        )
+        torch.cuda.empty_cache()
+
+    def _load_model_layerwise_by_transfer_engine(
+        self, model, transfer_engine, seed_url, tp_rank
+    ) -> None:
+        """Load model weights layer-by-layer via Transfer Engine RDMA reads.
+
+        Uses all-async-submit + ordered-polling pattern for maximum RDMA
+        pipeline utilization. All layer groups are submitted as async reads
+        upfront, then polled in layer order to mark readiness.
+        """
+        if not hasattr(transfer_engine, "batch_transfer_async_read"):
+            raise RuntimeError(
+                "Transfer Engine does not support async read API. "
+                "Upgrade mooncake to use layerwise transfer."
+            )
+
+        # 1. Fetch remote weight metadata
+        seed_session_id, seed_weight_info = (
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+        )
+        if seed_session_id is None or seed_weight_info is None:
+            raise RuntimeError(
+                "Cannot get transfer engine session or weight info from seed instance."
+            )
+
+        # 2. Group local params by layer
+        param_groups = self._group_params_by_layer(model)
+
+        num_layers = (
+            max(
+                (int(k.split("_")[1]) for k in param_groups if k.startswith("layer_")),
+                default=-1,
+            )
+            + 1
+        )
+
+        # 3. Build ordered group keys and per-group transfer lists
+        ordered_keys = ["embed_tokens"]
+        ordered_keys += [f"layer_{i}" for i in range(num_layers)]
+        ordered_keys += ["norm", "lm_head"]
+
+        group_transfer_args: Dict[str, Tuple[List[int], List[int], List[int]]] = {}
+        for group_key in ordered_keys:
+            params = param_groups.get(group_key, [])
+            if not params:
+                continue
+
+            client_ptr_list: List[int] = []
+            seed_ptr_list: List[int] = []
+            client_len_list: List[int] = []
+
+            for name, tensor in params:
+                weight_info = seed_weight_info.get(name, None)
+                if weight_info is None:
+                    raise RuntimeError(
+                        f"Cannot find weight info for {name} in seed instance."
+                    )
+
+                seed_ptr, seed_numel, seed_element_size = weight_info
+                if (
+                    seed_numel != tensor.numel()
+                    or seed_element_size != tensor.element_size()
+                ):
+                    raise RuntimeError(
+                        f"Weight info does not match for {name}, "
+                        f"expected ({seed_numel}, {seed_element_size}), "
+                        f"got ({tensor.numel()}, {tensor.element_size()})"
+                    )
+
+                client_ptr_list.append(tensor.data_ptr())
+                seed_ptr_list.append(seed_ptr)
+                client_len_list.append(tensor.numel() * tensor.element_size())
+
+            group_transfer_args[group_key] = (
+                client_ptr_list,
+                seed_ptr_list,
+                client_len_list,
+            )
+
+        # 4. Submit ALL groups async for maximum RDMA pipeline utilization
+        start_transfer_tic = time.time()
+        batch_ids: Dict[str, int] = {}
+        for group_key, (
+            client_ptrs,
+            seed_ptrs,
+            lengths,
+        ) in group_transfer_args.items():
+            batch_id = transfer_engine.batch_transfer_async_read(
+                seed_session_id,
+                client_ptrs,
+                seed_ptrs,
+                lengths,
+            )
+            if batch_id == 0:
+                raise RuntimeError(
+                    f"Failed to submit async read for group '{group_key}'."
+                )
+            batch_ids[group_key] = batch_id
+            logger.debug(f"Submitted async read for {group_key} (batch_id={batch_id})")
+
+        # 5. Poll in layer order, marking each group ready
+        if "embed_tokens" in batch_ids:
+            ret = transfer_engine.get_batch_transfer_status([batch_ids["embed_tokens"]])
+            if ret != 0:
+                self._transfer_error = RuntimeError(
+                    f"Transfer failed for embed_tokens (status={ret})"
+                )
+                raise self._transfer_error
+            self.layer_tracker.mark_embed_ready()
+            logger.debug("Embed tokens loaded and ready (via Transfer Engine)")
+
+        logger.info(f"Receiving {num_layers} layers via Transfer Engine...")
+        for layer_idx in range(num_layers):
+            layer_key = f"layer_{layer_idx}"
+            if layer_key in batch_ids:
+                ret = transfer_engine.get_batch_transfer_status([batch_ids[layer_key]])
+                if ret != 0:
+                    self._transfer_error = RuntimeError(
+                        f"Transfer failed for {layer_key} (status={ret})"
+                    )
+                    raise self._transfer_error
+                self.layer_tracker.mark_layer_ready(layer_idx)
+                logger.debug(f"Layer {layer_idx} loaded and ready (via Transfer Engine)")
+        logger.info(f"All {num_layers} layers received via Transfer Engine.")
+
+        for tail_key in ["norm", "lm_head"]:
+            if tail_key in batch_ids:
+                ret = transfer_engine.get_batch_transfer_status([batch_ids[tail_key]])
+                if ret != 0:
+                    self._transfer_error = RuntimeError(
+                        f"Transfer failed for {tail_key} (status={ret})"
+                    )
+                    raise self._transfer_error
+        self.layer_tracker.mark_lm_head_ready()
+        logger.debug("LM head and norm loaded and ready (via Transfer Engine)")
+
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
+
+        end_transfer_tic = time.time()
+        logger.info(
+            f"Finished layerwise weight loading via Transfer Engine, "
+            f"time used: {(end_transfer_tic - start_transfer_tic):.4f}s"
+        )
+
+    def _group_params_by_layer(
+        self, model
+    ) -> Dict[str, List[Tuple[str, torch.Tensor]]]:
+        """Group model parameters by layer prefix for ordered transfer.
+
+        Returns a dictionary mapping layer keys to lists of (name, tensor) tuples.
+        Keys are: 'embed_tokens', 'layer_0', 'layer_1', ..., 'norm', 'lm_head', 'other'
+        """
+        import re
+
+        param_groups: Dict[str, List[Tuple[str, torch.Tensor]]] = (
+            collections.defaultdict(list)
+        )
+
+        for name, param in model.named_parameters():
+            if "embed_tokens" in name:
+                param_groups["embed_tokens"].append((name, param))
+            elif "lm_head" in name:
+                param_groups["lm_head"].append((name, param))
+            elif ".norm" in name and "layers" not in name:
+                # Final norm layer (not layer-internal norms)
+                param_groups["norm"].append((name, param))
+            else:
+                # Try to match layer index: model.layers.{idx}.*
+                match = re.search(r"layers\.(\d+)\.", name)
+                if match:
+                    idx = int(match.group(1))
+                    param_groups[f"layer_{idx}"].append((name, param))
+                else:
+                    # Other parameters (could be model-specific)
+                    param_groups["other"].append((name, param))
+
+        return param_groups
+
+
 class RemoteModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote database."""
 
@@ -2296,7 +2832,7 @@ class RemoteModelLoader(BaseModelLoader):
                     param_data = param_data.narrow(dim, 0, size)
             if tensor.shape != param_shape:
                 logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
                     param_shape,
@@ -2311,7 +2847,6 @@ class RemoteModelLoader(BaseModelLoader):
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
-
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             model.load_weights(self._get_weights_iterator_fs(client))
@@ -2577,7 +3112,6 @@ class ModelOptModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         logger.info("ModelOptModelLoader: Loading base model...")
 
         # Store the original model path for tokenizer export
@@ -2742,6 +3276,9 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
         return RemoteInstanceModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.LAYERWISE_REMOTE_INSTANCE:
+        return LayerwiseBroadcastModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.PRIVATE:
         import importlib

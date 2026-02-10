@@ -108,6 +108,8 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
+    SendWeightsToRemoteInstanceLayerwiseReqInput,
+    SendWeightsToRemoteInstanceLayerwiseReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -1034,6 +1036,10 @@ class Scheduler(
                 (
                     SendWeightsToRemoteInstanceReqInput,
                     self.send_weights_to_remote_instance,
+                ),
+                (
+                    SendWeightsToRemoteInstanceLayerwiseReqInput,
+                    self.send_weights_to_remote_instance_layerwise,
                 ),
                 (
                     UpdateWeightsFromDistributedReqInput,
@@ -2505,6 +2511,11 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 
+        # Include layerwise loading progress if available
+        ret["loading_progress"] = (
+            self.tp_worker.model_runner.get_loading_progress()
+        )
+
         # This field is not serializable.
         ret.pop("model_config", None)
 
@@ -2728,6 +2739,15 @@ class Scheduler(
         """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
         return SendWeightsToRemoteInstanceReqOutput(success, message)
+
+    def send_weights_to_remote_instance_layerwise(
+        self, recv_req: SendWeightsToRemoteInstanceLayerwiseReqInput
+    ):
+        """Send the seed instance weights to the destination instance layer-by-layer."""
+        success, message = self.tp_worker.send_weights_to_remote_instance_layerwise(
+            recv_req
+        )
+        return SendWeightsToRemoteInstanceLayerwiseReqOutput(success, message)
 
     def slow_down(self, recv_req: SlowDownReqInput):
         t = recv_req.forward_sleep_time

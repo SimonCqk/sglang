@@ -604,6 +604,22 @@ async def server_info():
     }
 
 
+@app.get("/loading_progress")
+async def loading_progress():
+    """Get layerwise model loading progress.
+
+    Returns loading status per DP rank, including layer readiness info.
+    Useful during layerwise broadcast loading to monitor weight transfer progress.
+    """
+    internal_states = await _global_state.tokenizer_manager.get_internal_state()
+    return {
+        "loading_progress": [
+            state.get("loading_progress", {"fully_loaded": True, "progress": 1.0})
+            for state in internal_states
+        ]
+    }
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead)."""
@@ -863,6 +879,24 @@ async def send_weights_to_remote_instance(
 ):
     success, message = (
         await _global_state.tokenizer_manager.send_weights_to_remote_instance(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/send_weights_to_remote_instance_layerwise")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def send_weights_to_remote_instance_layerwise(
+    obj: SendWeightsToRemoteInstanceReqInput, request: Request
+):
+    """Send model weights to a remote instance layer-by-layer for computation overlap."""
+    success, message = (
+        await _global_state.tokenizer_manager.send_weights_to_remote_instance_layerwise(
             obj, request
         )
     )

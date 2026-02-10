@@ -123,7 +123,11 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    LayerwiseBroadcastModelLoader,
+    get_model_loader,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
@@ -389,9 +393,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if self.pp_size > 1:
-            assert (
-                self.support_pp
-            ), "Pipeline Parallel is not compatible with this model."
+            assert self.support_pp, (
+                "Pipeline Parallel is not compatible with this model."
+            )
 
         # For weight updates
         self._model_update_group = {}
@@ -413,6 +417,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args
+
+        # Initialize early: read by _forward_raw(), written by finalizer thread.
+        # Thread-safe under CPython GIL (atomic bool attribute assignment).
+        self._partial_weight_mode = False
+        self._layerwise_async_loading = False
+        self._pending_deferred_cuda_graph_init = False
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
@@ -572,7 +582,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
-            self.init_device_graphs()
+            if self._layerwise_async_loading:
+                # Defer CUDA graph capture - serve in eager mode first.
+                logger.info("Deferring CUDA graph capture for layerwise early serving.")
+                self.graph_runner = None
+                self.graph_mem_usage = 0
+            else:
+                self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
@@ -590,7 +606,132 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         # Initialize piecewise CUDA graph
+        if self._layerwise_async_loading:
+            self.piecewise_cuda_graph_runner = None
+        else:
+            self.init_piecewise_cuda_graphs()
+
+        # Handle layerwise async loading completion
+        if self._layerwise_async_loading:
+            self._finalize_layerwise_loading()
+
+    def _finalize_layerwise_loading(self):
+        """Handle completion of async layerwise weight transfer.
+
+        If transfer already finished during init, just do the barrier.
+        If early serving is enabled and transfer is still in progress,
+        enable partial weight mode and start a background finalization thread.
+        Otherwise, block until transfer completes.
+        """
+        loader = self.loader
+        assert isinstance(loader, LayerwiseBroadcastModelLoader)
+
+        if loader.layer_tracker.is_fully_loaded():
+            # Transfer already finished during init - no partial mode needed
+            logger.info(
+                "Layerwise transfer completed during init. No partial weight mode needed."
+            )
+            self._do_post_transfer_barrier()
+            return
+
+        # Transfer still in progress - enable early serving with partial weights
+        logger.info(
+            "Layerwise transfer still in progress. Enabling partial weight mode "
+            "for early serving (eager mode, no CUDA graphs)."
+        )
+        self._partial_weight_mode = True
+        loader.attach_layer_tracker(self.model)
+        self._start_loading_finalization_thread()
+
+    def _do_post_transfer_barrier(self):
+        """Run the TP barrier after transfer completes."""
+        if self.server_args.elastic_ep_backend == "mooncake":
+            dist.barrier(group=get_tp_group().cpu_group)
+        else:
+            try:
+                dist.monitored_barrier(
+                    group=get_tp_group().cpu_group,
+                    timeout=datetime.timedelta(
+                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
+                    ),
+                    wait_all_ranks=True,
+                )
+            except RuntimeError:
+                raise ValueError(
+                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+                ) from None
+
+    def _start_loading_finalization_thread(self):
+        """Start a background thread that waits for transfer completion and re-enables CUDA graphs."""
+
+        def _finalize():
+            loader = self.loader
+            assert isinstance(loader, LayerwiseBroadcastModelLoader)
+
+            try:
+                loader.wait_for_transfer_complete()
+                self._do_post_transfer_barrier()
+            except Exception as e:
+                logger.error(
+                    f"Layerwise loading finalization failed: {e}. "
+                    f"Model will remain in eager mode with partial weights."
+                )
+                # Don't switch back to graph mode on failure - stay in safe eager mode.
+                # The model may have incomplete weights so we keep the tracker attached.
+                return
+
+            loader.detach_layer_tracker(self.model)
+            # Signal deferred CUDA graph capture. Keep _partial_weight_mode = True
+            # until graphs are captured on the scheduler's main thread.
+            self._pending_deferred_cuda_graph_init = True
+            logger.info(
+                "Layerwise transfer complete. CUDA graph capture deferred to scheduler idle."
+            )
+
+        thread = threading.Thread(
+            target=_finalize, daemon=True, name="layerwise-finalizer"
+        )
+        thread.start()
+
+    def try_deferred_cuda_graph_capture(self):
+        """Capture CUDA graphs after layerwise transfer, called from scheduler main thread during idle."""
+        if not self._pending_deferred_cuda_graph_init:
+            return
+
+        self._pending_deferred_cuda_graph_init = False
+        logger.info("Starting deferred CUDA graph capture...")
+        self.init_device_graphs()
         self.init_piecewise_cuda_graphs()
+        self._partial_weight_mode = False
+        logger.info("Deferred CUDA graph capture complete. Switched from eager to CUDA graph mode.")
+
+    def get_loading_progress(self):
+        """Get the current loading progress for the /loading_progress endpoint."""
+        loader = getattr(self, "loader", None)
+        if not isinstance(loader, LayerwiseBroadcastModelLoader) or loader.layer_tracker is None:
+            return {
+                "fully_loaded": True,
+                "progress": 1.0,
+                "ready_layers": 0,
+                "total_layers": 0,
+                "embed_ready": True,
+                "lm_head_ready": True,
+            }
+
+        tracker = loader.layer_tracker
+        total = tracker.num_layers
+        ready = tracker.get_ready_layer_count()
+        # Progress: embed(1) + layers(N) + lm_head(1) = N+2 total components
+        total_components = total + 2
+        ready_components = ready + int(tracker.embed_ready.is_set()) + int(tracker.lm_head_ready.is_set())
+        return {
+            "fully_loaded": tracker.is_fully_loaded(),
+            "progress": round(ready_components / total_components, 4) if total_components > 0 else 1.0,
+            "ready_layers": ready,
+            "total_layers": total,
+            "embed_ready": tracker.embed_ready.is_set(),
+            "lm_head_ready": tracker.lm_head_ready.is_set(),
+        }
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -854,12 +995,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if (
-            self.server_args.load_format == LoadFormat.REMOTE_INSTANCE
+            self.server_args.load_format
+            in (LoadFormat.REMOTE_INSTANCE, LoadFormat.LAYERWISE_REMOTE_INSTANCE)
             and self.server_args.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
+            logger.info(
+                f"[TP rank {self.tp_rank}] Initializing remote instance weight loader with NCCL backend, "
+                f"seed_ip={self.server_args.remote_instance_weight_loader_seed_instance_ip}, "
+                f"service_port={self.server_args.remote_instance_weight_loader_seed_instance_service_port}, "
+                f"group_ports={self.server_args.remote_instance_weight_loader_send_weights_group_ports}"
+            )
             if self.tp_rank == 0:
                 instance_ip = socket.gethostbyname(socket.gethostname())
+                logger.info(
+                    f"[TP rank 0] Triggering init_weights_send_group request to seed instance, "
+                    f"local_ip={instance_ip}"
+                )
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,
                     args=(
@@ -886,10 +1038,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 load_config=self.load_config,
                 model_config=self.model_config,
             )
-            self.model = self.loader.load_model(
-                model_config=self.model_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
-            )
+            # Use async path for layerwise broadcast to overlap transfer with post-load init
+            if isinstance(self.loader, LayerwiseBroadcastModelLoader):
+                self.model = self.loader.start_async_transfer(
+                    model_config=self.model_config,
+                    device_config=DeviceConfig(self.device, self.gpu_id),
+                )
+                self._layerwise_async_loading = True
+            else:
+                self.model = self.loader.load_model(
+                    model_config=self.model_config,
+                    device_config=DeviceConfig(self.device, self.gpu_id),
+                )
+                self._layerwise_async_loading = False
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
                 self.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
@@ -971,23 +1132,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
-        if self.server_args.elastic_ep_backend == "mooncake":
-            # Mooncake does not support `monitored_barrier`
-            dist.barrier(group=get_tp_group().cpu_group)
-        else:
-            # Handle the case where some ranks do not finish loading.
-            try:
-                dist.monitored_barrier(
-                    group=get_tp_group().cpu_group,
-                    timeout=datetime.timedelta(
-                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
-                    ),
-                    wait_all_ranks=True,
-                )
-            except RuntimeError:
-                raise ValueError(
-                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-                ) from None
+        # Skip TP barrier for async layerwise loading - it will be done after
+        # the transfer completes (in initialize() or the finalization thread).
+        if not self._layerwise_async_loading:
+            if self.server_args.elastic_ep_backend == "mooncake":
+                # Mooncake does not support `monitored_barrier`
+                dist.barrier(group=get_tp_group().cpu_group)
+            else:
+                # Handle the case where some ranks do not finish loading.
+                try:
+                    dist.monitored_barrier(
+                        group=get_tp_group().cpu_group,
+                        timeout=datetime.timedelta(
+                            seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
+                        ),
+                        wait_all_ranks=True,
+                    )
+                except RuntimeError:
+                    raise ValueError(
+                        f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+                    ) from None
 
     def update_expert_location(
         self,
@@ -1092,15 +1256,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         group_name,
         backend="nccl",
     ):
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         ports_list = ports.split(",")
-        assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        assert len(ports_list) == self.tp_size, (
+            f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        )
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
@@ -1139,15 +1303,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ports,
         group_name,
     ):
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         ports_list = ports.split(",")
-        assert (
-            len(ports_list) == self.tp_size
-        ), f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        assert len(ports_list) == self.tp_size, (
+            f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        )
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
@@ -1180,6 +1344,191 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torch.cuda.empty_cache()
         return success, message
 
+    def send_weights_to_remote_instance_layerwise(
+        self,
+        master_address,
+        ports,
+        group_name,
+    ):
+        """Send model weights to a remote instance layer-by-layer.
+
+        This method sends weights in a specific order to enable the receiving
+        instance to start inference while still receiving later layers:
+        1. embed_tokens (embedding layer)
+        2. layers[0..N] (transformer layers in order)
+        3. norm (final normalization layer)
+        4. lm_head (output projection)
+
+        The transfer runs in a background thread with a low-priority CUDA stream
+        to minimize impact on inference performance (TTFT/TPOT).
+
+        Args:
+            master_address: IP address of the remote instance.
+            ports: Comma-separated list of ports for each TP rank.
+            group_name: Name of the communication group.
+
+        Returns:
+            Tuple of (success: bool, message: str).
+        """
+        import re
+        import collections
+        import threading
+
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
+        assert group_name != "", "Group name cannot be empty"
+
+        ports_list = ports.split(",")
+        assert len(ports_list) == self.tp_size, (
+            f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
+        )
+        group_port = ports_list[self.tp_rank]
+        full_group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+
+        if self._weights_send_group[full_group_name] is not None:
+            send_group = self._weights_send_group[full_group_name]
+        else:
+            message = f"Group {full_group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
+            logger.error(message)
+            return False, message
+
+        # Store reference to model and other needed data for background thread
+        model = self.model
+
+        def _do_layerwise_transfer():
+            """Background thread function for layerwise weight transfer.
+
+            Uses a low-priority CUDA stream to minimize impact on inference.
+            Non-pipelined: waits for each layer to complete before starting next.
+            """
+            try:
+                # Create a low-priority CUDA stream for transfer operations
+                # priority=-1 is lower priority than default (priority=0)
+                # This ensures GPU scheduler favors inference when resources are contended
+                transfer_stream = torch.cuda.Stream(priority=-1)
+
+                # Group parameters by layer prefix
+                param_groups = collections.defaultdict(list)
+
+                for name, param in model.named_parameters():
+                    if "embed_tokens" in name:
+                        param_groups["embed_tokens"].append((name, param))
+                    elif "lm_head" in name:
+                        param_groups["lm_head"].append((name, param))
+                    elif ".norm" in name and "layers" not in name:
+                        # Final norm layer (not layer-internal norms)
+                        param_groups["norm"].append((name, param))
+                    else:
+                        # Try to match layer index: model.layers.{idx}.*
+                        match = re.search(r"layers\.(\d+)\.", name)
+                        if match:
+                            idx = int(match.group(1))
+                            param_groups[f"layer_{idx}"].append((name, param))
+                        else:
+                            # Other parameters
+                            param_groups["other"].append((name, param))
+
+                # Determine number of layers
+                layer_indices = [
+                    int(k.split("_")[1])
+                    for k in param_groups.keys()
+                    if k.startswith("layer_")
+                ]
+                num_layers = max(layer_indices) + 1 if layer_indices else 0
+
+                # Send in order: embed_tokens -> layers 0..N -> norm -> lm_head -> other
+                # Each operation runs on the low-priority transfer stream
+                # Non-pipelined: synchronize after each layer to allow inference breathing room
+
+                # Use synchronous broadcasts with stream synchronization.
+                # This ensures proper NCCL collective completion before proceeding.
+                with torch.cuda.stream(transfer_stream):
+                    logger.debug("Sending embed_tokens weights...")
+                    for name, param in param_groups["embed_tokens"]:
+                        torch.distributed.broadcast(
+                            param.data,
+                            src=0,
+                            group=send_group,
+                        )
+                transfer_stream.synchronize()
+                logger.debug("embed_tokens sent")
+
+                logger.info(f"Sending {num_layers} layers via NCCL broadcast...")
+                for layer_idx in range(num_layers):
+                    layer_key = f"layer_{layer_idx}"
+                    with torch.cuda.stream(transfer_stream):
+                        logger.debug(f"Sending layer {layer_idx} weights...")
+                        for name, param in param_groups[layer_key]:
+                            torch.distributed.broadcast(
+                                param.data,
+                                src=0,
+                                group=send_group,
+                            )
+                    transfer_stream.synchronize()
+                    logger.debug(f"layer {layer_idx} sent")
+
+                with torch.cuda.stream(transfer_stream):
+                    logger.debug("Sending norm weights...")
+                    for name, param in param_groups["norm"]:
+                        torch.distributed.broadcast(
+                            param.data,
+                            src=0,
+                            group=send_group,
+                        )
+                transfer_stream.synchronize()
+                logger.debug("norm sent")
+
+                with torch.cuda.stream(transfer_stream):
+                    logger.debug("Sending lm_head weights...")
+                    for name, param in param_groups["lm_head"]:
+                        torch.distributed.broadcast(
+                            param.data,
+                            src=0,
+                            group=send_group,
+                        )
+                transfer_stream.synchronize()
+                logger.debug("lm_head sent")
+
+                # Send any remaining parameters
+                with torch.cuda.stream(transfer_stream):
+                    for name, param in param_groups["other"]:
+                        torch.distributed.broadcast(
+                            param.data,
+                            src=0,
+                            group=send_group,
+                        )
+                transfer_stream.synchronize()
+
+                logger.info(
+                    f"Succeeded to send weights layerwise through {master_address}:{group_port} {full_group_name}."
+                )
+            except Exception as e:
+                logger.error(f"Failed to send weights layerwise: {e}.")
+            finally:
+                # Cleanup: destroy the process group after sending weights
+                try:
+                    del self._weights_send_group[full_group_name]
+                    torch.distributed.distributed_c10d.destroy_process_group(send_group)
+                except Exception as cleanup_error:
+                    logger.warning(f"Error during cleanup: {cleanup_error}")
+                torch.cuda.empty_cache()
+
+        # Start the transfer in a background thread to not block the scheduler
+        # This allows the sender to continue serving inference requests
+        transfer_thread = threading.Thread(
+            target=_do_layerwise_transfer,
+            name=f"layerwise_transfer_{full_group_name}",
+            daemon=True,
+        )
+        transfer_thread.start()
+
+        # Return immediately - transfer continues in background
+        return (
+            True,
+            f"Layerwise transfer started in background to {master_address}:{group_port}",
+        )
+
     def init_weights_update_group(
         self,
         master_address,
@@ -1199,9 +1548,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
         """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), (
+            "Default torch process group must be initialized"
+        )
         assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank
@@ -2287,7 +2636,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else forward_batch.forward_mode.is_cuda_graph
         )
         can_run_graph = bool(
-            mode_check()
+            not self._partial_weight_mode
+            and mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
         )

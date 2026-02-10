@@ -315,6 +315,9 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
+        # Deferred CUDA graph capture after layerwise early serving transfer completes.
+        self.tp_worker.model_runner.try_deferred_cuda_graph_capture()
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if len(self.disagg_prefill_inflight_queue) > 0:
                 return

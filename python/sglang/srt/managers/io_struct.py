@@ -1324,6 +1324,26 @@ class SendWeightsToRemoteInstanceReqOutput(BaseReq):
 
 
 @dataclass
+class SendWeightsToRemoteInstanceLayerwiseReqInput(BaseReq):
+    """Input for layer-by-layer weight transfer to remote instance."""
+
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The group name
+    group_name: str = "weight_send_group"
+
+
+@dataclass
+class SendWeightsToRemoteInstanceLayerwiseReqOutput(BaseReq):
+    """Output for layer-by-layer weight transfer to remote instance."""
+
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsUpdateGroupReqInput(BaseReq):
     # The master address
     master_address: str

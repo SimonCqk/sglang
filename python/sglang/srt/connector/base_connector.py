@@ -4,6 +4,7 @@ import os
 import shutil
 import signal
 import tempfile
+import threading
 from abc import ABC, abstractmethod
 from typing import Generator, List, Optional, Tuple
 
@@ -24,9 +25,13 @@ class BaseConnector(ABC):
         self.url = url
         self.closed = False
         self.local_dir = tempfile.mkdtemp()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            existing_handler = signal.getsignal(sig)
-            signal.signal(sig, self._close_by_signal(existing_handler))
+        # signal.signal() only works in the main thread. When a connector is
+        # created from a background thread (e.g. layerwise async transfer),
+        # skip signal registration — cleanup is still handled by __exit__/__del__.
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                existing_handler = signal.getsignal(sig)
+                signal.signal(sig, self._close_by_signal(existing_handler))
 
     def get_local_dir(self):
         return self.local_dir
